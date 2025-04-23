@@ -19,9 +19,9 @@ jobs:
   isort:
     runs-on: ubuntu-latest
     container: 
-      image: node-654e3bca7fbeeed18f81d7c7.ps-xaas.io/dev-ops/build-executor@sha256:1aa34c00b4cc4ebb949b875e86f3bbf75731944f28e88b37dbb14e890a64cd3b
+      image: node-654e3bca7fbeeed18f81d7c7.ps-xaas.io/dev-ops/build-executor@sha256:5e0b21794cbfdc5ccfe376db1b852e5cc8bd7bb7e1eecbef76dfb3770ce4870e
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
       - run: |
           mkdir -p "${EU_XFSC_BDD_CORE_PATH}/.."
           cd "${EU_XFSC_BDD_CORE_PATH}/.."
@@ -37,7 +37,7 @@ jobs:
     container:
       image: node-654e3bca7fbeeed18f81d7c7.ps-xaas.io/dev-ops/build-executor@sha256:5e0b21794cbfdc5ccfe376db1b852e5cc8bd7bb7e1eecbef76dfb3770ce4870e
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
       - run: |
           mkdir -p "${EU_XFSC_BDD_CORE_PATH}/.."
           cd "${EU_XFSC_BDD_CORE_PATH}/.."
@@ -60,7 +60,7 @@ jobs:
     container:
       image: node-654e3bca7fbeeed18f81d7c7.ps-xaas.io/dev-ops/build-executor@sha256:5e0b21794cbfdc5ccfe376db1b852e5cc8bd7bb7e1eecbef76dfb3770ce4870e
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
       - run: |
           mkdir -p "${EU_XFSC_BDD_CORE_PATH}/.."
           cd "${EU_XFSC_BDD_CORE_PATH}/.."
@@ -81,7 +81,7 @@ jobs:
     container:
       image: node-654e3bca7fbeeed18f81d7c7.ps-xaas.io/dev-ops/build-executor@sha256:5e0b21794cbfdc5ccfe376db1b852e5cc8bd7bb7e1eecbef76dfb3770ce4870e
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
       - run: |
           mkdir -p "${EU_XFSC_BDD_CORE_PATH}/.."
           cd "${EU_XFSC_BDD_CORE_PATH}/.."
