@@ -1,0 +1,611 @@
+version: '3.9'
+networks:
+  internal:
+    driver: bridge
+  resolver:
+    driver: bridge
+  external:
+    driver: bridge
+
+volumes:
+  shared_volume:
+  hydra-sqlite:
+  redis:
+    driver: local
+
+services:
+  cassandra:
+    container_name: $PROJECT_NAME-cassandra
+    image: cassandra:latest
+    restart: always
+    hostname: cassandra
+    ports:
+      - "9042:9042"
+    networks:
+      - internal
+    healthcheck:
+      test: ["CMD-SHELL", "[ $$(nodetool statusgossip) = running ]"]
+      interval: 30s
+      timeout: 10s
+      retries: 10
+
+  initialize_cassandra:
+    image: nuvo/docker-cqlsh
+    command: cqlsh -f /cql/initialize.cql --cqlversion="3.4.7"
+    networks:
+      - internal
+    environment:
+      CQLSH_PORT: 9042
+      CQLVERSION: 3.4.7
+    volumes:
+      - "./scripts/cql/initialize.cql:/cql/initialize.cql"
+    depends_on:
+      cassandra:
+        condition: service_healthy
+
+  nats:
+    networks:
+      - internal
+      
+    image: nats:2.10.10
+    ports:
+      - 4222:4222
+      - 8222:8222
+
+  vault:
+    image: hashicorp/vault
+    ports:
+      - 8200:8200
+    networks:
+      - internal
+      
+    environment:
+      - VAULT_DEV_ROOT_TOKEN_ID=test
+    healthcheck:
+      test: [ "CMD-SHELL", "sh -c 'VAULT_ADDR=http://vault:8200 vault status'"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 5s
+
+  vault-init:
+    # to create a new key // curl --header "X-Vault-Token: test" --request POST --data @keyConfig.json http://localhost:8200/v1/tenant_space/keys/signerkey
+    # retrieve a key backup and save it to signerkey.json // curl --header "X-Vault-Token: test" --request GET  http://localhost:8200/v1/tenant_space/backup/signerkey
+    image: curlimages/curl:latest
+    depends_on:
+      vault:
+        condition: service_healthy
+    networks:
+      - internal
+    volumes:
+      - ./scripts/vault/init-keys.sh:/vault-scripts/init-keys.sh
+      - ./scripts/vault/signerkey.json:/vault-scripts/signerkey.json
+    command: ["/vault-scripts/init-keys.sh"]
+
+  postgres:
+    image: postgres:14-alpine
+    networks:
+      - internal
+      
+    ports:
+      - 5432:5432
+    volumes:
+#      - ./data:/var/lib/postgresql/data
+     - ./scripts/sql:/docker-entrypoint-initdb.d
+
+    environment:
+      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_USER=postgres
+      - POSTGRES_DB=postgres
+
+    healthcheck:
+      test: ["CMD-SHELL", "sh -c 'pg_isready -U postgres -d postgres'"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+
+  redis:
+    image: redis:6.2-alpine
+    networks:
+        - internal
+    restart: always
+    ports:
+      - '6379:6379'
+    command: redis-server --save 20 1 --loglevel warning --requirepass redis
+    volumes:
+      - redis:/data
+
+  hydra:
+    image: oryd/hydra:v2.2.0-rc.3
+    ports:
+      - "4444:4444" # Public port
+      - "4445:4445" # Admin port
+      - "5555:5555" # Port for hydra token user
+    command: serve -c /etc/config/hydra/hydra.yml all --dev
+    volumes:
+      - type: volume
+        source: hydra-sqlite
+        target: /var/lib/sqlite
+        read_only: false
+      - type: bind
+        source: ./hydra
+        target: /etc/config/hydra
+    environment:
+      - DSN=postgres://hydra:secret@postgres:5432/hydra?sslmode=disable&max_conns=20&max_idle_conns=4
+      - SECRETS_SYSTEM=myhydrasecret12345
+      - URLS_SELF_ISSUER=http://hydra:4444
+      - URLS_CONSENT=http://consent:3000/consent
+      - URLS_LOGIN=http://consent:3000/login
+      - SERVE_PUBLIC_CORS_ENABLED=true
+      - SERVE_PUBLIC_CORS_ALLOWED_ORIGINS=http://localhost:3000
+      - LOG_LEVEL=debug
+      - LOG_LEAK_SENSITIVE_VALUES=true
+      - OAUTH2_ACCESS_TOKEN_STRATEGY=jwt
+
+    restart: unless-stopped
+    depends_on:
+      hydra-migrate:
+        condition: service_completed_successfully
+    networks:
+      - internal
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:4444/.well-known/openid-configuration"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 2s
+
+  hydra-client-setup:
+    image: oryd/hydra:v2.2.0-rc.3
+    networks:
+      - internal
+    depends_on:
+      hydra:
+        condition: service_healthy
+    entrypoint: /bin/sh
+#    command: echo 'starting hydra client setup' && CLIENT_INFO=$$(hydra create client --endpoint http://hydra:4445 --name bridge --secret secret --grant-type client_credential --response-type token,code --scope openid,offline --token-endpoint-auth-method client_secret_post --format json) && echo $$CLIENT_INFO | jq -r .client_id > /shared/client_id.txt && echo 'Client created successfully. CLIENT_ID saved to /client_id/hydra_client_id.txt'
+    command: >
+      -c "
+      echo 'Starting hydra client setup' &&
+      CLIENT_INFO=$$(hydra create client --endpoint http://hydra:4445 --name bridge --secret secret --grant-type client_credentials --response-type token,code --scope openid,offline --token-endpoint-auth-method client_secret_basic --format json) &&
+      CLIENT_ID=$$(echo \"$$CLIENT_INFO\" | sed -n 's/.*\"client_id\":\"\\([^\"]*\\)\".*/\\1/p') &&
+      echo \"PREAUTHBRIDGE_OAUTH_CLIENTID=$$CLIENT_ID\" > /shared/client_id.env &&
+      if [ $$? -eq 0 ]; then
+        echo 'Client created successfully. CLIENT_ID saved to /shared/client_id.env'
+        cat /shared/client_id.env
+      else
+        echo 'Failed to create client or save CLIENT_ID'
+        exit 1
+      fi
+      "
+    volumes:
+      - ./shared:/shared
+
+  hydra-migrate:
+    image: oryd/hydra:v2.2.0-rc.3
+    environment:
+      - DSN=postgres://hydra:secret@postgres:5432/hydra?sslmode=disable&max_conns=20&max_idle_conns=4
+    command: migrate -c /etc/config/hydra/hydra.yml sql -e --yes
+    volumes:
+      - type: volume
+        source: hydra-sqlite
+        target: /var/lib/sqlite
+        read_only: false
+      - type: bind
+        source: ./hydra
+        target: /etc/config/hydra
+    restart: on-failure
+    networks:
+      - internal
+
+  consent:
+    environment:
+      - HYDRA_ADMIN_URL=http://hydra:4445
+    image: oryd/hydra-login-consent-node:v2.2.0-rc.3
+    ports:
+      - "3000:3000"
+    restart: unless-stopped
+    networks:
+      - internal
+
+# microservices
+  signer:
+    image: node-654e3bca7fbeeed18f81d7c7.ps-xaas.io/tsa/signer:main
+    ports:
+      - 8080:8080
+    networks:
+      - internal
+    depends_on:
+      - sdjwt
+    environment:
+        SDJWT_SERVICE_URL: http://sdjwt:3000
+        VAULT_ADRESS: http://vault:8200
+        VAULT_TOKEN: test
+        NATS_HOST: nats://nats:4222
+        NATS_TOPIC: signer-topic
+        NATS_STATUS_TOPIC: status.data.create
+        NATS_STATUS_VERIFY_TOPIC: status.data.verify
+        CLOUDEVENTPROVIDER_MESSAGING_PROTOCOL: nats
+        CLOUDEVENTPROVIDER_MESSAGING_NATS_URL: nats:4222
+        ENGINE_PATH: /opt/plugins/hashicorp-vault-provider.so
+  sdjwt:
+    image: node-654e3bca7fbeeed18f81d7c7.ps-xaas.io/common-services/sdjwt-service:main
+    networks:
+      - internal
+    ports:
+      - 8087:3000
+    environment:
+      SDJWT_SERVICE_LOG_LEVEL: INFO
+
+
+  status-list-service:
+    image: node-654e3bca7fbeeed18f81d7c7.ps-xaas.io/ocm-wstack/status-list-service:main
+    networks:
+      - internal
+    ports:
+      - 8081:8081
+    environment:
+     - DEFAULT_DID=did:jwk:ew0KICAia3R5IjogIkVDIiwNCiAgImtleV9vcHMiOiBbDQogICAgInNpZ24iLA0KICAgICJ2ZXJpZnkiDQogIF0sDQogICJhbGciOiAiRVMyNTYiLA0KICAia2lkIjogInNpZ25lcmtleSIsDQogICJjcnYiOiAiUC0yNTYiLA0KICAieCI6ICJTN0lOWk1xb1J5cklUdHgzN29ONzFMZlNuOXFMSU5Wa3RJZGZ4U2h2bjFvIiwNCiAgInkiOiAiSVVDVjY5LUxIRXJXM2loaGVnN05mNTRaNlk4THJmR21DLTBGdjlIeHhCOCINCn0
+     - DEFAULT_GROUP=
+     - DEFAULT_HOST=http://localhost:8084/v1/tenants/tenant_space
+     - DEFAULT_KEY=signerkey
+     - DEFAULT_LISTTYPE=StatusList2021
+     - DEFAULT_NAMESPACE=tenant_space
+     - SIGNER_TOPIC=signer-topic
+     - SIGNER_URL=http://localhost:8080/v1
+     - STATUSLIST_DATABASE_HOST=postgres
+     - STATUSLIST_DATABASE_PARAMS=sslmode:disable
+     - STATUSLIST_DATABASE_PASSWORD=postgres
+     - STATUSLIST_DATABASE_USER=postgres
+     - STATUSLIST_LISTEN_PORT=8081
+     - STATUSLIST_NATS_URL=nats://localhost:4222
+  credential-retrieval-service:
+    image:  node-654e3bca7fbeeed18f81d7c7.ps-xaas.io/ocm-wstack/credential-retrieval-service:main
+    networks:
+      - internal
+    ports:
+      - 8000:8000
+    depends_on:
+      cassandra:
+        condition: service_healthy
+      initialize_cassandra:
+        condition: service_completed_successfully
+      nats:
+        condition: service_started
+    environment:
+      CREDENTIALRETRIEVAL_CASSANDRA_HOST: cassandra:9042
+      CREDENTIALRETRIEVAL_CASSANDRA_KEYSPACE: tenant_space
+      CREDENTIALRETRIEVAL_CASSANDRA_PASSWORD: cassandra
+      CREDENTIALRETRIEVAL_CASSANDRA_USER: cassandra
+      CREDENTIALRETRIEVAL_COUNTRY: DE
+      CREDENTIALRETRIEVAL_DISABLETLS: true
+      CREDENTIALRETRIEVAL_LISTEN_ADDR: 0.0.0.0
+      CREDENTIALRETRIEVAL_LISTEN_PORT : 8000
+      CREDENTIALRETRIEVAL_METADATAPOLICY:
+      CREDENTIALRETRIEVAL_NATS_QUEUE_GROUP: offering
+      CREDENTIALRETRIEVAL_NATS_REQUEST_TIMEOUT: 10s
+      CREDENTIALRETRIEVAL_NATS_URL: nats://nats:4222
+      CREDENTIALRETRIEVAL_OFFERINGPOLICY :
+      CREDENTIALRETRIEVAL_OFFERING_TOPIC: offering
+      CREDENTIALRETRIEVAL_REGION: EU
+      CREDENTIALRETRIEVAL_SIGNER_TOPIC: signer-topic
+      CREDENTIALRETRIEVAL_STORING_TOPIC: storage
+  dummy-issuer:
+    image: node-654e3bca7fbeeed18f81d7c7.ps-xaas.io/ocm-wstack/dummycontentsigner:main
+    networks:
+      - internal
+    ports:
+      - 4200:4200
+    depends_on:
+      nats:
+        condition: service_started
+      signer:
+        condition: service_started
+    environment:
+      SIGNERURL: http://signer:8080/v1/credential
+      SIGNERKEY: signerkey
+      NATS_URL: nats://nats:4222
+      NATS_QUEUE_GROUP: dummysigner
+      NATS_REQUEST_TIMEOUT: 10s
+      ORIGIN: http://status-list-service:8081/v1/tenants/tenant_space
+      CREDENTIAL_ISSUER: $DUMMY_CREDENTIAL_ISSUER_VALUE
+#      CREDENTIAL_ISSUER: "http://well_known_service:8084/v1/tenants/tenant_space"
+#      CREDENTIAL_ISSUER: did:jwk:ew0KICAia3R5IjogIkVDIiwNCiAgImtleV9vcHMiOiBbDQogICAgInNpZ24iLA0KICAgICJ2ZXJpZnkiDQogIF0sDQogICJhbGciOiAiRVMyNTYiLA0KICAia2lkIjogInNpZ25lcmtleSIsDQogICJjcnYiOiAiUC0yNTYiLA0KICAieCI6ICJTN0lOWk1xb1J5cklUdHgzN29ONzFMZlNuOXFMSU5Wa3RJZGZ4U2h2bjFvIiwNCiAgInkiOiAiSVVDVjY5LUxIRXJXM2loaGVnN05mNTRaNlk4THJmR21DLTBGdjlIeHhCOCINCn0
+      AUTHORIZATION_SERVER: "http://pre_auth_bridge_service:8083"
+      CREDENTIAL_ENDPOINT: "http://issuance_service:8082/v1/tenants/tenant_space/credential"
+
+  issuance_service:
+    image: node-654e3bca7fbeeed18f81d7c7.ps-xaas.io/ocm-wstack/issuance-service:main
+    networks:
+      - internal
+    ports:
+      - 8082:8082
+    depends_on:
+      postgres:
+        condition: service_healthy
+      nats:
+        condition: service_started
+    environment:
+      ISSUANCE_AUDIENCE :
+      ISSUANCE_JWKSURL : http://hydra:4444/.well-known/jwks.json
+      ISSUANCE_LISTEN_ADDR : 0.0.0.0
+      ISSUANCE_LISTEN_PORT : 8082
+      ISSUANCE_NATS_URL : nats://nats:4222
+
+  pre_auth_bridge_service:
+    image: node-654e3bca7fbeeed18f81d7c7.ps-xaas.io/ocm-wstack/pre-authorization-bridge:main
+    networks:
+        - internal
+    ports:
+      - 8083:8083
+#    command: >
+#      sh -c "
+#      export PREAUTHBRIDGE_OAUTH_CLIENTID=13f9e506-a195-4fe5-b11b-df0ffed32aee;
+#      echo 'wrote PREAUTHBRIDGE_OAUTH_CLIENTID=$PREAUTHBRIDGE_OAUTH_CLIENTID';
+#      echo $PREAUTHBRIDGE_OAUTH_CLIENTID;
+#      "/preauthbridge";
+#      "
+    depends_on:
+      hydra-client-setup:
+        condition: service_completed_successfully
+      nats:
+        condition: service_started
+      redis:
+        condition: service_started
+    environment:
+      PREAUTHBRIDGE_LISTEN_ADDR: 0.0.0.0
+      PREAUTHBRIDGE_LISTEN_PORT: 8083
+      PREAUTHBRIDGE_NATS_URL: nats://nats:4222
+      PREAUTHBRIDGE_OAUTH_CLIENT_SECRET: secret
+      PREAUTHBRIDGE_TWOFACTORTOPIC: two-factor.pin
+#      PREAUTHBRIDGE_OAUTH_CLIENTID set by hydra-client-setup
+#      PREAUTHBRIDGE_OAUTH_CLIENTID: 7771c639-1479-4ecc-ac25-d1c88d87337f
+      PREAUTHBRIDGE_REDIS_HOSTS: redis:6379
+      PREAUTHBRIDGE_REDIS_PASSWORD: redis
+      PREAUTHBRIDGE_LOG_LEVEL: debug
+      PREAUTHBRIDGE_WELLKNOWN_TOKEN_ENDPOINT: http://pre_auth_bridge_service:8083/token
+
+    env_file:
+      - ./shared/client_id.env
+
+  well_known_service:
+    image: node-654e3bca7fbeeed18f81d7c7.ps-xaas.io/ocm-wstack/well-known-service:main
+    networks:
+      - internal
+    ports:
+      - 8084:8084
+
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+    environment:
+      WELLKNOWN_SERVICE_LOG_LEVEL: INFO
+      WELLKNOWN_SERVICE_IS_DEV: false
+      WELLKNOWN_SERVICE_LISTEN_ADDR: 0.0.0.0
+      WELLKNOWN_SERVICE_LISTEN_PORT: 8084
+      WELLKNOWN_SERVICE_POSTGRES_HOST: postgres
+      WELLKNOWN_SERVICE_POSTGRES_PORT: 5432
+      WELLKNOWN_SERVICE_POSTGRES_DATABASE: postgres
+      WELLKNOWN_SERVICE_POSTGRES_USER: postgres
+      WELLKNOWN_SERVICE_POSTGRES_PASSWORD: postgres
+      WELLKNOWN_SERVICE_POSTGRES_PARAMS: "sslmode:disable"
+      WELLKNOWN_SERVICE_NATS_URL: nats
+      WELLKNOWN_SERVICE_NATS_QUEUE_GROUP: wellknown
+      WELLKNOWN_SERVICE_NATS_REQUEST_TIMEOUT: 10s
+      WELLKNOWN_SERVICE_OPEN_ID_ISSUER: dummycontentsigner
+      WELLKNOWN_SERVICE_CREDENTIAL_ISSUER_IMPORTER: BROADCAST
+      WELLKNOWN_SERVICE_CREDENTIAL_GIT_IMAGE_PATH:
+      WELLKNOWN_SERVICE_CREDENTIAL_GIT_REPO:
+      WELLKNOWN_SERVICE_CREDENTIAL_GIT_TOKEN:
+      WELLKNOWN_SERVICE_CREDENTIAL_GIT_INTERVAL: ""
+
+  storage:
+    image: node-654e3bca7fbeeed18f81d7c7.ps-xaas.io/ocm-wstack/storage-service:main
+    networks:
+      - internal
+    ports:
+      - 8085:8085
+    depends_on:
+      cassandra:
+        condition: service_healthy
+      nats:
+        condition: service_started
+      initialize_cassandra:
+        condition: service_completed_successfully
+    environment:
+      LISTEN_ADDR: 0.0.0.0
+      LISTEN_PORT: 8085
+      LOG_LEVEL: DEBUG
+      STORAGESERVICE_LOG_LEVEL: DEBUG
+      STORAGESERVICE_LOGLEVEL: DEBUG
+      STORAGESERVICE_CASSANDRA_HOST: cassandra:9042
+      STORAGESERVICE_CASSANDRA_KEYSPACE: tenant_space
+      STORAGESERVICE_CASSANDRA_PASSWORD: cassandra
+      STORAGESERVICE_CASSANDRA_USER: cassandra
+      STORAGESERVICE_COUNTRY: DE
+      STORAGESERVICE_CRYPTO_NAMESPACE: transit
+      STORAGESERVICE_CRYPTO_SIGNKEY: test
+      STORAGESERVICE_MESSAGING_ENABLED: true
+      STORAGESERVICE_MESSAGING_QUEUEGROUP: storage-service
+      STORAGESERVICE_MESSAGING_STORAGETOPIC: storage
+      STORAGESERVICE_MESSAGING_URL: nats:4222
+      STORAGESERVICE_MODE: DIRECT
+      STORAGESERVICE_PROFILE: DEBUG,API
+      STORAGESERVICE_REGION: EU
+      VAULT_ADRESS: http://vault:8200
+      VAULT_TOKEN: test
+
+  credential-verification-service:
+    image: node-654e3bca7fbeeed18f81d7c7.ps-xaas.io/ocm-wstack/credential-verification-service:main
+    networks:
+      - internal
+    ports:
+      - 8086:8086
+    depends_on:
+      cassandra:
+        condition: service_healthy
+      initialize_cassandra:
+        condition: service_completed_successfully
+      nats:
+        condition: service_started
+    environment:
+      CREDENTIALVERIFICATION_LISTEN_ADDR: 0.0.0.0
+      CREDENTIALVERIFICATION_LISTEN_PORT: 8086
+      CREDENTIALVERIFICATION_PUBLICBASEPATH: /v1/tenants/tenant_space/presentation/proof
+      CREDENTIALVERIFICATION_AUTHORIZEENDPOINT: http://credential-verification-service:8086/v1/tenants/tenant_space/presentation/
+      CREDENTIALVERIFICATION_CASSANDRAHOSTS: cassandra
+      CREDENTIALVERIFICATION_CASSANDRAPASSWORD: cassandra
+      CREDENTIALVERIFICATION_CASSANDRAUSER: cassandra
+      CREDENTIALVERIFICATION_IS_DEV: false
+      CREDENTIALVERIFICATION_LOG_LEVEL: debug
+      CREDENTIALVERIFICATION_MESSAGING_NATS_URL: nats:4222
+      CREDENTIALVERIFICATION_SERVERMODE: debug
+      CREDENTIALVERIFICATION_SIGNERSERVICE_SIGNERTOPIC: signer-topic
+      CREDENTIALVERIFICATION_SIGNERSERVICE_PRESENTATIONSIGNURL: http://signer:8080/v1/presentation/proof
+      CREDENTIALVERIFICATION_SIGNERSERVICE_PRESENTATIONVERIFYURL: http://signer:8080/v1/presentation/verify
+      CREDENTIALVERIFICATION_SIGNINGKEY: LS0tLS1CRUdJTiBFQyBQUklWQVRFIEtFWS0tLS0tCk1FRUNBUUF3RXdZSEtvWkl6ajBDQVFZSUtvWkl6ajBEQVFjRUp6QWxBZ0VCQkNCNDVQQlk0aVBOY0lwTVd6emYKei9uYXdxbmxIYlhTeFdjNUJWK1hyMzB5dkE9PQotLS0tLUVORCBFQyBQUklWQVRFIEtFWS0tLS0t
+      CREDENTIALVERIFICATION_TOPICS_AUTHORIZATION: presentation.authorisation
+      CREDENTIALVERIFICATION_TOPICS_AUTHORIZATIONREPLY: presentation.authorisation.reply
+      CREDENTIALVERIFICATION_TOPICS_PRESENTATINREQUEST: request
+      CREDENTIALVERIFICATION_TOPICS_PROOFNOTIFY: presentation.proof.notify
+      CREDENTIALVERIFICATION_TOPICS_STORAGEREQUEST: storage
+      DID_RESOLVER: "http://host.docker.internal:9091"
+
+
+  didcomconnector:
+    image: node-654e3bca7fbeeed18f81d7c7.ps-xaas.io/common-services/didcomm-connector:refactoring
+    environment:
+      #      DIDCOMM SETUP
+      DIDCOMMCONNECTOR_ENV: "DEV"
+      DIDCOMMCONNECTOR_LOGLEVEL: "info"
+      DIDCOMMCONNECTOR_PORT: 9090
+      DIDCOMMCONNECTOR_URL: "http://host.docker.internal:9090"
+      DIDCOMMCONNECTOR_LABEL: "My Mediator"
+      DIDCOMMCONNECTOR_TOKENEXPIRATION: 500000
+      DIDCOMMCONNECTOR_DIDCOMM_RESOLVERURL: "http://host.docker.internal:9091"
+      DIDCOMMCONNECTOR_DIDCOMM_ISMESSAGEENCRYPTED: false
+      #      DATABASE SETUP
+      DIDCOMMCONNECTOR_DATBASE_INMEMORY: false
+      DIDCOMMCONNECTOR_DATBASE_HOST: "cassandra:9042"
+      DIDCOMMCONNECTOR_DATBASE_PORT: 9042
+      DIDCOMMCONNECTOR_DATBASE_USER: "cassandra"
+      DIDCOMMCONNECTOR_DATBASE_PASSWORD: "cassandra"
+      DIDCOMMCONNECTOR_DATBASE_KEYSPACE: "dcc"
+      DIDCOMMCONNECTOR_DATBASE_DBNAME: "cassandra"
+      #      CLOUDEVENT PROVIDER SETUP
+      DIDCOMMCONNECTOR_CLOUDFORWARDING_PROTOCOL: "nats"
+      DIDCOMMCONNECTOR_CLOUDFORWARDING_NATS_URL: "nats://nats:4222"
+      DIDCOMMCONNECTOR_CLOUDFORWARDING_NATS_TOPIC: "/message/receive"
+      DIDCOMMCONNECTOR_CLOUDFORWARDING_NATS_QUEUEGROUP: "logger"
+      DIDCOMMCONNECTOR_CLOUDFORWARDING_HTTP_URL: "http://localhost:1111"
+    container_name: dcc
+    depends_on:
+      cassandra:
+        condition: service_healthy
+      uni-resolver:
+        condition: service_healthy
+      nats:
+          condition: service_started
+    ports:
+      - "9090:9090"
+    networks:
+      - internal
+
+
+
+  uni-resolver:
+    image: universalresolver/uni-resolver-web:latest
+    container_name: uni-resolver
+    ports:
+      - "9091:8080"
+    healthcheck:
+      test: curl --fail http://uni-resolver:8080/1.0/testIdentifers || exit 1
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    environment:
+      uniresolver_web_driver_url_did_jwk:  http://host.docker.internal:8134
+      uniresolver_web_driver_url_did_peer: http://host.docker.internal:8135
+      uniresolver_web_driver_url_did_web:  http://host.docker.internal:8134
+    networks:
+      - resolver
+    depends_on:
+      - did-jwk-driver
+      - uni-resolver-driver-did-uport
+  uni-resolver-driver-did-uport:
+    image: uport/uni-resolver-driver-did-uport:4.3.7
+    ports:
+      - "8135:8081"
+    networks:
+      - internal
+  did-jwk-driver:
+    image: transmute/restricted-resolver:latest
+    ports:
+      - "8134:8080"
+    networks:
+      - internal
+
+
+
+#  uni-resolver:
+#    image: uport/uni-resolver-driver-did-uport:4.3.0
+#    #    container_name: uni-resolver
+#    ports:
+#      - "9091:8081"
+#    healthcheck:
+#      test: curl --fail http://uni-resolver:8081/health || exit 1
+#      interval: 10s
+#      timeout: 5s
+#      retries: 5
+#    networks:
+#      - resolver
+
+
+  nats_external:
+    networks:
+      - external
+    image: nats:2.10.10
+    ports:
+      - 4220:4222
+      - 8220:8222
+
+
+  didcomconnector_external:
+    image: node-654e3bca7fbeeed18f81d7c7.ps-xaas.io/common-services/didcomm-connector:refactoring
+    environment:
+      #      DIDCOMM SETUP
+      DIDCOMMCONNECTOR_ENV: "DEV"
+      DIDCOMMCONNECTOR_LOGLEVEL: "info"
+      DIDCOMMCONNECTOR_PORT: 9090
+      DIDCOMMCONNECTOR_URL: "http://host.docker.external:9092"
+      DIDCOMMCONNECTOR_LABEL: "My Mediator"
+      DIDCOMMCONNECTOR_TOKENEXPIRATION: 500000
+      DIDCOMMCONNECTOR_DIDCOMM_RESOLVERURL: "http://host.docker.internal:9091"
+      DIDCOMMCONNECTOR_DIDCOMM_ISMESSAGEENCRYPTED: false
+      #      DATABASE SETUP
+      DIDCOMMCONNECTOR_DATBASE_INMEMORY: false
+      DIDCOMMCONNECTOR_DATBASE_HOST: "host.docker.internal:9042"
+      DIDCOMMCONNECTOR_DATBASE_PORT: 9042
+      DIDCOMMCONNECTOR_DATBASE_USER: "cassandra"
+      DIDCOMMCONNECTOR_DATBASE_PASSWORD: "cassandra"
+      DIDCOMMCONNECTOR_DATBASE_KEYSPACE: "dcc2"
+      DIDCOMMCONNECTOR_DATBASE_DBNAME: "cassandra"
+      #    CLOUDEVENT PROVIDER SETUP
+      DIDCOMMCONNECTOR_CLOUDFORWARDING_PROTOCOL: "nats"
+      DIDCOMMCONNECTOR_CLOUDFORWARDING_NATS_URL: "nats://nats_external:4222"
+      DIDCOMMCONNECTOR_CLOUDFORWARDING_NATS_TOPIC: "/message/receive"
+      DIDCOMMCONNECTOR_CLOUDFORWARDING_NATS_QUEUEGROUP: "logger"
+      DIDCOMMCONNECTOR_CLOUDFORWARDING_HTTP_URL: "http://localhost:1111"
+    container_name: dcc_ext
+    depends_on:
+      cassandra:
+        condition: service_healthy
+      uni-resolver:
+        condition: service_healthy
+      nats_external:
+        condition: service_started
+    ports:
+      - "9092:9090"
+    networks:
+      - external

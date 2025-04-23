@@ -1,0 +1,98 @@
+name: Test Pipeline
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+env:
+  EU_XFSC_BDD_CORE_PATH: https://github.com/eclipse-xfsc/bdd-executor
+  SOURCE_PATHS: src
+  VENV_PATH_DEV: ${{ github.workspace }}/.cache/.venv
+  PYLINTHOME: ${{ github.workspace }}/.cache/pylint
+  PIP_CACHE_DIR: ${{ github.workspace }}/.cache/pip
+  DOCKER: podman
+  ARG_BDD_JUNIT: --junit --junit-directory=.tmp/behave/
+
+jobs:
+  isort:
+    runs-on: ubuntu-latest
+    container: 
+      image: node-654e3bca7fbeeed18f81d7c7.ps-xaas.io/dev-ops/build-executor@sha256:5e0b21794cbfdc5ccfe376db1b852e5cc8bd7bb7e1eecbef76dfb3770ce4870e
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          mkdir -p "${EU_XFSC_BDD_CORE_PATH}/.."
+          cd "${EU_XFSC_BDD_CORE_PATH}/.."
+          git clone https://github.com/eclipse-xfsc/bdd-executor.git
+          cd "${GITHUB_WORKSPACE}"
+          mkdir -p "${PYLINTHOME}/"
+          mkdir -p "${PIP_CACHE_DIR}/"
+          make setup_dev
+          make isort
+
+  pylint:
+    runs-on: ubuntu-latest
+    container:
+      image: node-654e3bca7fbeeed18f81d7c7.ps-xaas.io/dev-ops/build-executor@sha256:5e0b21794cbfdc5ccfe376db1b852e5cc8bd7bb7e1eecbef76dfb3770ce4870e
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          mkdir -p "${EU_XFSC_BDD_CORE_PATH}/.."
+          cd "${EU_XFSC_BDD_CORE_PATH}/.."
+          git clone https://github.com/eclipse-xfsc/bdd-executor.git
+          cd "${GITHUB_WORKSPACE}"
+          mkdir -p "${PYLINTHOME}/"
+          mkdir -p "${PIP_CACHE_DIR}/"
+          make setup_dev
+          export ARG_PYLINT_JUNIT="--output-format=junit"
+          make pylint > ".tmp/pylint.xml"
+          export ARG_COVERAGE_PYTEST=--junit-xml=".tmp/pytest.xml"
+          make coverage_run coverage_report
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pylint-report
+          path: .tmp/pytest.xml
+
+  mypy:
+    runs-on: ubuntu-latest
+    container:
+      image: node-654e3bca7fbeeed18f81d7c7.ps-xaas.io/dev-ops/build-executor@sha256:5e0b21794cbfdc5ccfe376db1b852e5cc8bd7bb7e1eecbef76dfb3770ce4870e
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          mkdir -p "${EU_XFSC_BDD_CORE_PATH}/.."
+          cd "${EU_XFSC_BDD_CORE_PATH}/.."
+          git clone https://github.com/eclipse-xfsc/bdd-executor.git
+          cd "${GITHUB_WORKSPACE}"
+          mkdir -p "${PYLINTHOME}/"
+          mkdir -p "${PIP_CACHE_DIR}/"
+          make setup_dev
+          export ARG_MYPY_SOURCE_XML="--junit-xml='.tmp/mypy-source.xml'"
+          make mypy
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mypy-report
+          path: .tmp/mypy-source.xml
+
+  run-bdd:
+    runs-on: ubuntu-latest
+    container:
+      image: node-654e3bca7fbeeed18f81d7c7.ps-xaas.io/dev-ops/build-executor@sha256:5e0b21794cbfdc5ccfe376db1b852e5cc8bd7bb7e1eecbef76dfb3770ce4870e
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          mkdir -p "${EU_XFSC_BDD_CORE_PATH}/.."
+          cd "${EU_XFSC_BDD_CORE_PATH}/.."
+          git clone https://github.com/eclipse-xfsc/bdd-executor.git
+          cd "${GITHUB_WORKSPACE}"
+          mkdir -p "${PYLINTHOME}/"
+          mkdir -p "${PIP_CACHE_DIR}/"
+          make setup_dev
+          mkdir -p ".tmp/behave/"
+          make run_bdd_dev
+      - uses: actions/upload-artifact@v4
+        with:
+          name: bdd-results
+          path: .tmp/behave/*.xml

@@ -1,0 +1,5 @@
+{
+    "allow_plaintext_backup": true,
+    "exportable": true,
+    "type": "ecdsa-p256"
+}
