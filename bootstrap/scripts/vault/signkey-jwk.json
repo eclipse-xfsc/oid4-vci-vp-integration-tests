@@ -1,0 +1,12 @@
+{
+  "kty": "EC",
+  "key_ops": [
+    "sign",
+    "verify"
+  ],
+  "alg": "ES256",
+  "kid": "signerkey",
+  "crv": "P-256",
+  "x": "S7INZMqoRyrITtx37oN71LfSn9qLINVktIdfxShvn1o",
+  "y": "IUCV69-LHErW3ihheg7Nf54Z6Y8LrfGmC-0Fv9HxxB8"
+}
